@@ -1,0 +1,285 @@
+---
+title: 'AML vs ALL'
+author: "Jenny Smith"
+date: "November 13, 2018"
+output: html_document
+---
+
+
+
+```{r setup}
+library(knitr)
+knitr::opts_chunk$set(tidy.opts=list(width.cutoff=50),tidy=TRUE, fig.align='center', fig.height=5, fig.width=8)
+knitr::opts_knit$set(root.dir = '/fh/fast/meshinchi_s/workingDir/TARGET/AML_TARGET/RNA/mRNAseq/analysis/2018.11.13_AML_vs_ALL/')
+options(stringsAsFactors = FALSE)
+```
+
+
+```{r message = FALSE, warning=FALSE}
+library(stringr)
+library(magrittr)
+library(ggplot2)
+library(dplyr)
+library(tibble)
+library(tidyr)
+getwd()
+```
+
+
+#Define Functions
+
+
+```{r}
+matchCompartment <- function(gene, df){
+  #keywords: extracellular, plasma membrane, transmembrane
+  library(dplyr)
+  
+  
+  regex <- paste0("\\b", gene,"\\b")
+    
+  comp <- df %>%
+      filter(grepl(regex, V2, ignore.case = TRUE)) %>%
+      filter(grepl("extracellular|plasma membrane|transmembrane|Cell periphery", V4, ignore.case = TRUE)) %>%
+      dplyr::select(V4)
+    
+  res <- paste(unlist(unique(comp)),collapse="; ")
+  
+  
+  return(res)
+}
+
+```
+
+
+
+
+#Read in the Clinical Data
+
+
+```{r}
+CDE.0531 <- read.csv("~/reference_mapping-files/TARGET_AML_current_asof_june30_2016_UPDATED_CLEAN_4.19.18.csv")
+
+rownames(CDE.0531) <- CDE.0531$TARGET.USI.1
+head(CDE.0531[,1:5])
+dim(CDE.0531)
+```
+
+```{r}
+pheno.data <- read.delim("/fh/fast/meshinchi_s/workingDir/TARGET/NormalTissue_GTEX/Clinical/TcgaTargetGTEX_phenotype.txt")
+
+head(pheno.data)
+dim(pheno.data)
+```
+
+
+
+#Read in the Expression Data
+
+NOTE: this dataset was already converted into linear scale. NOT log2(TPMs) anymore. 
+```{r}
+TPMs <- get(load("/fh/fast/meshinchi_s/workingDir/TARGET/NormalTissue_GTEX/RNA/mRNAseq/level3/gene/2016Sept_UCSC_Illumina_data/Rdata/TcgaTargetGtex_rsem_dupGenesRemoved_tpm.RData"))
+
+head(TPMs[,1:5])
+dim(TPMs) #58531 19261
+```
+
+
+#Read in the Gene Annotations
+
+```{r}
+compartments <- read.delim("~/RNA_seq_Analysis/0000.00.02_Reference_GeneInfo/human_compartment_knowledge_full.tsv", sep = "\t",as.is = TRUE, stringsAsFactors = FALSE, header = FALSE)
+  
+dim(compartments)
+```
+
+
+
+#Select Samples of Interest 
+
+```{r}
+data.types <- pheno.data %>%
+  group_by(detailed_category) %>%
+  summarize(Number=n()) 
+
+```
+
+
+```{r}
+pheno.AML_ALL <- pheno.data %>%
+  filter(X_study != "TCGA") %>%
+  filter(grepl("Acute Lymphoblastic Leukemia|Acute Myeloid Leukemia|Whole Blood", detailed_category)) %>%
+  mutate(sample.colname=gsub("-", "\\.", sample)) %>%
+  mutate(Group=case_when(
+    grepl("Whole Blood", detailed_category) ~ "NormalBlood",
+    grepl("Lympho", detailed_category) & grepl("Recurrent", X_sample_type) ~ "ALL_Relapse",
+    grepl("Lympho", detailed_category) & ! grepl("Recurrent", X_sample_type) ~ "ALL_Diagnostic",
+
+    grepl("Myeloid", detailed_category) & grepl("Recurrent", X_sample_type) ~ "AML_Relapse",
+    grepl("Myeloid", detailed_category) & ! grepl("Recurrent", X_sample_type) ~ "AML_Diagnostic"))
+  
+
+head(pheno.AML_ALL)
+dim(pheno.AML_ALL) #759   7
+```
+
+```{r}
+table(pheno.AML_ALL$detailed_category, pheno.AML_ALL$X_study)
+table(pheno.AML_ALL$Group)
+
+write.csv(table(pheno.AML_ALL$Group),"GroupSizes.csv", row.names=FALSE)
+```
+
+
+#Compare the Expression of Genes Across AML and ALL
+
+```{r}
+TPMs.m <- TPMs %>%
+  rownames_to_column("Gene") %>%
+  select(Gene,pheno.AML_ALL$sample.colname) %>%
+  filter(rowSums(select_if(., is.numeric)) > 0) %>% #remove non-expressed genes only 
+  
+  gather(Sample, TPM, -Gene) %>%
+  left_join(., pheno.AML_ALL, by=c("Sample"="sample.colname")) %>%
+  
+  mutate(Group=case_when(
+    grepl("Whole Blood", detailed_category) ~ "NormalBlood",
+    grepl("Lympho", detailed_category) & grepl("Recurrent", X_sample_type) ~ "ALL_Relapse",
+    grepl("Lympho", detailed_category) & ! grepl("Recurrent", X_sample_type) ~ "ALL_Diagnostic",
+
+    grepl("Myeloid", detailed_category) & grepl("Recurrent", X_sample_type) ~ "AML_Relapse",
+    grepl("Myeloid", detailed_category) & ! grepl("Recurrent", X_sample_type) ~ "AML_Diagnostic"))
+
+head(TPMs.m[,])
+dim(TPMs.m) #50918 by  760 (about 8,000 genes not expressed at all)
+```
+
+There appears to be an oddly great amount of normals with low expression across tons of genes. 
+I am starting to wonder if this dataset is really any good at all.... 
+
+```{r}
+normals <- TPMs.m %>%
+  filter(Group=="NormalBlood") %>%
+  
+  #for each gene, finds the ones with 0.5 TPMs in all normals
+  #and the mean for normals must be less than 0.5 TPM across  all samples
+  group_by(Gene) %>%
+  mutate(Low.Expn=sum(TPM <= 0.5) >= n()*0.8) %>%
+  mutate(Mean.Expn=mean(TPM)) %>%
+  mutate(Low.Mean=Mean.Expn <= 0.5) %>%
+  ungroup() %>%
+  
+  # #filter only genes that satisfy the low expression criteria
+  filter(Low.Expn==TRUE, Low.Mean==TRUE) %>%
+  arrange(desc(Mean.Expn))
+
+head(normals)
+
+#35,987 out of 50,000 genes have VERY low expression... Would really expect this is to be fewer genes. like 9-10K at most...
+length(table(normals$Gene)) 
+```
+
+```{r}
+TPMs.comp <- TPMs.m %>%
+  
+  #start with looking for genes lowly expressed in normals
+  filter(Gene %in% normals$Gene) %>%
+  
+  #Identify genes with at least 25% of patients are high expressors, and mean across all samples is high. 
+  group_by(Group,Gene) %>%
+  mutate(High.Expn=sum(TPM >= 10) >= n()*.25) %>%
+  ungroup() 
+  
+
+options(scipen=999)
+head(TPMs.comp)
+dim(TPMs.comp)
+length(unique(TPMs.comp$Gene))
+```
+
+
+```{r}
+GOI <- TPMs.comp %>%
+  #select genes that have high expression in ALL and AML diagnostic samples 
+  filter(grepl("Diagnostic", Group)) %>%
+  select(Gene,Group,High.Expn) %>%
+  arrange(Gene) %>%
+  
+  #de-duplicate the dataframe since I want only 2 entries per gene, 1 for AML as T/F and 1 for ALL as T/F
+  group_by(Gene) %>%
+  filter(!duplicated(Group)) %>%
+  ungroup() %>%
+  
+  #Select genes with hgih expression in BOTH leukemias
+  spread(Group,High.Expn)  %>%
+  filter(AML_Diagnostic==TRUE, ALL_Diagnostic==TRUE)
+
+  
+
+head(GOI)
+dim(GOI) #only 28 genes... 
+```
+
+  # select(-primary.disease.or.tissue, 
+  #        -X_primary_site, -X_study, -primary.disease.or.tissue, -High.Expn, -X_gender) %>%
+vars(AC002454.1:ZBTB10)
+
+Percent.Expressors=round((sum(. >= 10, na.rm = T)/n())*100, digits = 2))
+Number.Samples=n()
+
+  
+```{r}
+TPMs.GOI.mat <- TPMs.comp %>%
+  filter(Gene %in% GOI$Gene) %>%
+  select(Sample,Gene,Group,TPM) %>%
+  spread(Gene,TPM) 
+
+
+head(TPMs.GOI.mat)
+dim(TPMs.GOI.mat)
+
+# write.csv(TPMs.GOI.mat, "Genes_High_in_AML_ALL_TOIL_Reprocessed_TPMs.csv", row.names = FALSE)
+```
+
+```{r}
+TPMs.GOI <- TPMs.comp %>%
+  filter(Gene %in% GOI$Gene) %>%
+  spread(Gene,TPM) %>%
+  
+  group_by(Group) %>%
+  summarize_at(vars(AC002454.1:ZBTB10), funs(
+                               Max.TPM=max(., na.rm = T), 
+                               Median.TPM=median(., na.rm = T), 
+                               Mean.TPM=mean(., na.rm = T), 
+                               
+                               Number.Expressors=sum(. >= 10, na.rm = T), 
+                               Number.In.Group=n(), 
+                               Percent.Expressors=round((sum(. >= 10, na.rm = T)/n())*100, digits = 2))) %>%
+  ungroup() %>%
+  
+  gather(Stat,Results,matches("Max|Mean|Median|Number|Percent")) %>%
+  mutate(Gene=gsub("^(.+)_[MNP].+", "\\1", Stat),
+         Stat=gsub("^.+_([MNP])", "\\1", Stat)) %>%
+  spread(Stat,Results) %>%
+
+  select(Group,Gene, matches("Number"), matches("Percent") ,matches("max|mean|median")) %>%
+  arrange(Gene) %>%
+  
+  rowwise() %>%
+  mutate(Cellular.Compartment=matchCompartment(gene=Gene,df=compartments)) %>%
+  ungroup()
+
+
+
+dim(TPMs.GOI)
+head(TPMs.GOI)
+# write.csv(TPMs.GOI,"Genes_High_in_AML_ALL_TOIL_Reprocessed_SummaryStats.csv", row.names = FALSE)
+```
+
+
+
+#Session Information 
+
+```{r}
+sessionInfo()
+```
+
